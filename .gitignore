@@ -1,0 +1,7 @@
+config.json
+RoleDetails/
+*.xlsx
+__pycache__/
+.DS_Store
+.vscode/
+.idea/
