@@ -95,6 +95,31 @@ There's deliberately no `--admin-key` flag: command-line arguments show up in th
 
 The script prints how many roles it found and which xlsx files it wrote. Report that back plainly. If it exits with an error, the message is already written for a human to act on - relay it rather than re-diagnosing from scratch.
 
+If a workbook is open in Excel the save fails with `PermissionError: [Errno 13]`. Ask the user to close the file and re-run; don't write to a different path to route around it.
+
+A group fetch that 403s is not fatal - the run continues and every Membership tab reads "(no groups assigned to this role)". Because it only warns on stderr, say so explicitly when reporting the run rather than letting it pass as a clean export. The cause is a key without `read:rbac_groups`, and the usual reason is that **compliance read scopes and RBAC scopes are mutually exclusive**: a key holding any `read:compliance_*` scope cannot also hold `read:rbac_groups`. Tell the user to re-create the key without compliance scopes. `read:analytics` and `read:rbac_groups` coexist fine, so one key can serve both this export and the analytics endpoints.
+
+### Connector names
+
+Connector permissions come back with only an opaque ID (`mcpsrv_...`), and nothing on the RBAC surface resolves it. Don't guess a name from the ID.
+
+`/v1/organizations/analytics/connectors` exists and answers 200 with the `read:analytics` scope, but it is a *usage* report, not a connector registry: the docs state names are normalized across sources (`mcp-atlassian` and `Atlassian MCP server` both surface as `atlassian`), and it returned zero rows on every date sampled from January to August 2026, so whether its rows even carry the `mcpsrv_` ID needed to join back to a permission row is unconfirmed. Treat it as an open lead, not a solution - and don't present it to the user as one.
+
+Names come from an optional `connectors.json`, read from the working directory then the skill directory (or `--connectors <path>`):
+
+```json
+{
+  "connectors": {
+    "mcpsrv_01ExampleConnectorOne00": "Asana",
+    "mcpsrv_01ExampleConnectorTwo00": "Microsoft 365"
+  }
+}
+```
+
+A flat `{id: name}` object works too. When IDs go unnamed, the script writes `connectors.unresolved.json` into the output directory, pre-filled with every ID and an empty value for each, and prints the count. Point the user at that file: they read the display names off [claude.ai > Organization settings > Connectors](https://claude.ai/admin-settings/connectors), fill in the blanks, save it as `connectors.json`, and re-run. The Connectors tab labels every row on the next pass.
+
+Offer this once, after reporting the run. Unnamed rows are still readable - the ID is right there - so treat it as an improvement, not a failure.
+
 ## Step 5 - offer to save the values
 
 Only if the user supplied the admin key in chat this session, and only after the run succeeded: ask whether they'd like the values saved to `config.json` so they won't be asked again. Then re-run the check and save if they agree:
@@ -113,8 +138,15 @@ One .xlsx workbook per role, with tabs:
 1. **Membership** - groups assigned to the role, and the members in each
 2. **Capabilities** - every observed capability, with an Enabled flag
 3. **Permissions** - admin permissions with their access level
-4. **Connectors** - connectors / tools / scopes with their approval setting
+4. **Connectors** - one row per connector / tool / scope, with its approval setting
 5. **Models** - models available to the role, with a Default flag
 6. **Unclassified** - any permission row the classifier didn't recognize (only written when non-empty)
 
-All files are written to the output directory (default: `RoleDetails/`) and named after the role name.
+All files are written to the output directory (default: `RoleDetails/`) and named `<Role>_<yyyymmdd_hhmmss>.xlsx`. Every workbook in one run shares a single timestamp, so a run's files sort together and successive runs accumulate rather than overwrite. Nothing prunes old exports - if the directory gets noisy, say so rather than deleting files unprompted.
+
+Two things worth knowing when reading the output back to a user:
+
+- **Capabilities** covers every capability seen across *all* roles, so each workbook shows the full list with a per-role Yes/No. A role holding a blanket grant (`capability_access_all`, or `..._ga` for generally-available only) gets a `BLANKET GRANT` row at the top, and the individual rows below read Yes with "Granted via blanket grant".
+- **Connectors** merges the separate `use` and `always_allow` rows the API returns for a single connector into one row. "Approval Setting" is the derived answer - `Always allow (no prompt)`, `Ask each time`, `Allowed`, or `Blocked` - and "Granted Actions" keeps the raw actions behind it.
+
+An empty **Unclassified** tab is the normal case, and the tab is omitted entirely when nothing lands in it. If one does appear, it means the API returned a resource type the classifier hasn't seen; report the rows as-is rather than guessing where they belong.

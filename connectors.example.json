@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this file to connectors.json and fill in the names. Connector permissions carry only opaque IDs (mcpsrv_...), and no API endpoint resolves them, so this mapping is what labels the Connectors tab. After any run, RoleDetails/connectors.unresolved.json lists your real IDs pre-filled with empty values - start from that file rather than typing IDs by hand. Read the display names off claude.ai > Organization settings > Connectors. A flat {id: name} object works too.",
+  "connectors": {
+    "mcpsrv_EXAMPLE_REPLACE_ME_00000001": "Asana",
+    "mcpsrv_EXAMPLE_REPLACE_ME_00000002": "Microsoft 365"
+  }
+}

@@ -12,6 +12,12 @@ each role with tabs for:
     5. Models       - models available to the role, with a Default flag
     6. Unclassified - any permission row the classifier didn't recognize
 
+Connector permissions carry only opaque IDs (mcpsrv_...) and no endpoint on the
+RBAC surface resolves them, so names come from an optional connectors.json mapping;
+unnamed IDs are written to a fill-in template in the output directory.
+
+Files are named <Role>_<yyyymmdd_hhmmss>.xlsx, sharing one timestamp per run.
+
 Requires: requests, openpyxl (install with: pip install requests openpyxl)
 Python 3 standard library for the rest.
 
@@ -29,6 +35,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -117,14 +124,21 @@ def resolve_settings_source(args) -> dict:
         "api_base_url": (api_base_url or "").strip(),
     }
 
+    # Only admin_key carries a placeholder. api_base_url in config.example.json is a
+    # real working default, so comparing it against the example would reject every
+    # config that sensibly left it alone.
     example = load_example_placeholders()
-    for key, value in resolved.items():
-        if not value or value == str(example.get(key, "")):
-            sys.exit(
-                f"Missing or placeholder value for '{key}'. "
-                f"Set it in config.json, via the {ENV_ADMIN_KEY} environment variable, "
-                f"or both."
-            )
+    if not resolved["admin_key"] or resolved["admin_key"] == str(example.get("admin_key", "")):
+        sys.exit(
+            "Missing or placeholder value for 'admin_key'. "
+            f"Set it in config.json, via the {ENV_ADMIN_KEY} environment variable, "
+            "or both."
+        )
+    if not resolved["api_base_url"]:
+        sys.exit(
+            "Missing value for 'api_base_url'. Leave it out entirely to use the default "
+            f"({DEFAULT_API_BASE_URL}), or set a real endpoint."
+        )
 
     return resolved
 
@@ -137,6 +151,82 @@ def save_config(config: dict, path: Path) -> None:
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Connector names
+# --------------------------------------------------------------------------
+
+CONNECTOR_MAP_NAME = "connectors.json"
+CONNECTOR_EXAMPLE_NAME = "connectors.example.json"
+UNRESOLVED_STUB_NAME = "connectors.unresolved.json"
+# Keys carrying this marker come from connectors.example.json copied but never edited.
+CONNECTOR_PLACEHOLDER = "EXAMPLE_REPLACE_ME"
+
+
+def load_connector_names(explicit: str | None) -> dict[str, str]:
+    """Map connector IDs (mcpsrv_...) to human-readable names.
+
+    No endpoint on the RBAC surface lists an organization's connectors, so the
+    permission rows carry bare IDs with nothing to resolve them against. The
+    analytics API does expose /v1/organizations/analytics/connectors (needs the
+    read:analytics scope), but it reports *usage*, not a registry: names there are
+    normalized across sources ("mcp-atlassian" and "Atlassian MCP server" both
+    become "atlassian"), and whether rows carry the mcpsrv_ ID needed to join back
+    to these permissions is unconfirmed — the endpoint returned no rows on any date
+    tested. So this reads an operator-maintained mapping instead. Accepts either a
+    flat {id: name} object or {"connectors": {id: name}}.
+    """
+    candidates = [Path(explicit)] if explicit else [
+        Path.cwd() / CONNECTOR_MAP_NAME,
+        SKILL_DIR / CONNECTOR_MAP_NAME,
+    ]
+    found_any = False
+    for path in candidates:
+        if not path.exists():
+            continue
+        found_any = True
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            sys.stderr.write(f"  WARNING: ignoring '{path}' ({e})\n")
+            continue
+        if not isinstance(data, dict):
+            sys.stderr.write(f"  WARNING: ignoring '{path}' (expected a JSON object)\n")
+            continue
+        inner = data.get("connectors") if isinstance(data.get("connectors"), dict) else data
+        mapping = {
+            str(k): str(v) for k, v in inner.items()
+            if v and not str(k).startswith("_") and CONNECTOR_PLACEHOLDER not in str(k)
+        }
+        if mapping:
+            print(f"  connector names: {len(mapping)} from {path}")
+            return mapping
+        # A file that resolved nothing (still all placeholders, or emptied out) must not
+        # shadow a real mapping further down the search path.
+        sys.stderr.write(f"  note: '{path}' supplied no connector names; looking further\n")
+    if explicit and not found_any:
+        sys.exit(f"Connector map not found at '{explicit}'.")
+    return {}
+
+
+def write_unresolved_stub(ids: set[str], names: dict[str, str], out_dir: Path) -> Path | None:
+    """Drop a fill-in-the-blanks template for IDs we couldn't name."""
+    missing = sorted(i for i in ids if i not in names)
+    if not missing:
+        return None
+    payload = {
+        "_comment": (
+            "Rename this file to connectors.json (in the working directory or the "
+            "skill directory) and replace each empty value with the connector's "
+            "display name from claude.ai > Organization settings > Connectors. "
+            "Existing names already resolved are included for reference."
+        ),
+        "connectors": {**{i: names[i] for i in sorted(names)}, **{i: "" for i in missing}},
+    }
+    path = out_dir / UNRESOLVED_STUB_NAME
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +282,17 @@ CONNECTOR_RESOURCES = {"connector", "connector_tool", "connector_scope", "all_co
 BLANKET_ACTIONS = {"capability_access_all", "capability_access_all_ga"}
 ACCESS_RANK = {"no_access": 0, "view": 1, "can_view": 1, "manage": 2, "can_manage": 2}
 
+# How a connector grant is described once its rows are merged. Ordered most- to
+# least-permissive; the first action present wins, so a connector carrying both
+# "use" and "always_allow" reports as auto-approved rather than merely allowed.
+CONNECTOR_ACTION_LABELS = {
+    "always_allow": "Always allow (no prompt)",
+    "interactive": "Ask each time",
+    "use": "Allowed",
+    "no_access": "Blocked",
+}
+CONNECTOR_ACTION_ORDER = ("no_access", "always_allow", "interactive", "use")
+
 
 def bucket(perm: dict) -> str:
     res = perm.get("resource") or {}
@@ -205,8 +306,10 @@ def bucket(perm: dict) -> str:
     if rtype == "organization":
         if action.startswith("permission_"):
             return "permissions"
-        if action in BLANKET_ACTIONS or action.startswith("capability_"):
-            return "capabilities"
+        # Everything else scoped to the organization is a capability. The API emits
+        # these both prefixed (capability_access_all) and bare (chat, skill_creation),
+        # so matching on a "capability_" prefix would strand the bare ones.
+        return "capabilities"
     return "unclassified"
 
 
@@ -297,7 +400,10 @@ def safe_name(name: str) -> str:
 
 
 def build_workbook(role: dict, groups: list[dict], perms: list[dict],
-                   universe: dict[str, set[str]], out_dir: Path) -> Path:
+                   universe: dict[str, set[str]], out_dir: Path,
+                   connector_names: dict[str, str] | None = None,
+                   stamp: str = "") -> Path:
+    connector_names = connector_names or {}
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -347,22 +453,57 @@ def build_workbook(role: dict, groups: list[dict], perms: list[dict],
                 ["Admin Permission", "Action Key", "Access Type"], rows)
 
     # --- 4. Connectors -----------------------------------------------------
-    rows = []
-    for p in sorted(buckets["connectors"], key=lambda x: json.dumps(x.get("resource"), sort_keys=True)):
+    # One row per distinct target. The API emits access and approval as separate
+    # permission rows for the same connector ("use" alongside "always_allow"), which
+    # read as duplicates in a spreadsheet, so collapse them and derive one setting.
+    merged: dict[tuple, set[str]] = defaultdict(set)
+    for p in buckets["connectors"]:
         res = p.get("resource") or {}
-        rtype = res["type"]
+        key = (res.get("type", ""), res.get("connector_id") or "",
+               res.get("tool_name") or "", res.get("scope") or "")
+        merged[key].add(p.get("action", ""))
+
+    def sort_key(item):
+        (rtype, cid, _tool, _scope), _actions = item
+        name = connector_names.get(cid, "")
+        # Org-wide default first, then named connectors A-Z, then unnamed IDs.
+        tier = 0 if rtype == "all_connectors" else (1 if name else 2)
+        return (tier, name.lower(), cid)
+
+    rows = []
+    for (rtype, cid, tool, scope_name), actions in sorted(merged.items(), key=sort_key):
         scope = {
             "all_connectors": "All connectors",
             "connector": "Whole connector",
             "connector_tool": "Individual tool",
             "connector_scope": "OAuth scope",
         }.get(rtype, rtype)
-        target = res.get("tool_name") or res.get("scope") or res.get("connector_id") or "(all)"
-        rows.append([res.get("connector_id", "-"), scope, target, prettify(p.get("action", ""))])
+        # Only name a tool or scope here. Falling back to the connector ID repeats
+        # the ID column and tells the reader nothing new.
+        if tool:
+            target = tool
+        elif scope_name:
+            target = scope_name
+        elif rtype == "all_connectors":
+            target = "(every connector)"
+        else:
+            target = "(entire connector)"
+        if rtype == "all_connectors":
+            name = "All connectors (organization-wide default)"
+        else:
+            name = connector_names.get(cid) or "(unnamed - add to connectors.json)"
+        approval = next((CONNECTOR_ACTION_LABELS[a] for a in CONNECTOR_ACTION_ORDER
+                         if a in actions), None)
+        if approval is None:
+            approval = ", ".join(prettify(a) for a in sorted(actions)) or "-"
+        rows.append([name, cid or "-", scope, target, approval,
+                     ", ".join(sorted(actions))])
     if not rows:
-        rows = [["(no connector grants - all connectors blocked for this role)", "", "", ""]]
+        rows = [["(no connector grants - all connectors blocked for this role)",
+                 "", "", "", "", ""]]
     write_sheet(wb.create_sheet("Connectors"),
-                ["Connector ID", "Scope", "Tool / Scope", "Approval Setting"], rows)
+                ["Connector", "Connector ID", "Scope", "Tool / Scope",
+                 "Approval Setting", "Granted Actions"], rows)
 
     # --- 5. Models ---------------------------------------------------------
     rows = []
@@ -388,7 +529,8 @@ def build_workbook(role: dict, groups: list[dict], perms: list[dict],
         write_sheet(wb.create_sheet("Unclassified"),
                     ["Resource Type", "Action", "Raw Resource"], rows)
 
-    path = out_dir / f"{safe_name(role.get('name', role['id']))}.xlsx"
+    base = safe_name(role.get("name", role["id"]))
+    path = out_dir / (f"{base}_{stamp}.xlsx" if stamp else f"{base}.xlsx")
     wb.save(path)
     return path
 
@@ -420,6 +562,12 @@ def main() -> int:
         "--no-groups",
         action="store_true",
         help="Skip the Membership tab (use if your key isn't scoped for all linked orgs)"
+    )
+    ap.add_argument(
+        "--connectors",
+        default=None,
+        help=f"Path to a {{connector_id: name}} map (default: ./{CONNECTOR_MAP_NAME}, "
+             f"then <skill-dir>/{CONNECTOR_MAP_NAME})"
     )
     args = ap.parse_args()
 
@@ -463,11 +611,30 @@ def main() -> int:
                 if b in universe:
                     universe[b].add(p["action"])
 
+        connector_names = load_connector_names(args.connectors)
+        connector_ids = {
+            (p.get("resource") or {}).get("connector_id")
+            for perms in perms_by_role.values() for p in perms
+            if bucket(p) == "connectors" and (p.get("resource") or {}).get("connector_id")
+        }
+
+        # One stamp for the whole run, so a single export's files sort together.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         print("Writing workbooks...")
         for r in roles:
             p = build_workbook(r, groups_by_role.get(r["id"], []),
-                               perms_by_role[r["id"]], universe, out)
+                               perms_by_role[r["id"]], universe, out,
+                               connector_names, stamp)
             print(f"  {p}")
+
+        stub = write_unresolved_stub(connector_ids, connector_names, out)
+        if stub:
+            unnamed = len(connector_ids - set(connector_names))
+            print(f"\n{unnamed} connector ID(s) had no name available. The Admin API has no "
+                  f"endpoint that lists connectors,\nso names must be supplied manually. "
+                  f"A template is at:\n  {stub}\nFill in the names, save it as "
+                  f"'{CONNECTOR_MAP_NAME}', and re-run to label the Connectors tab.")
 
         # Save config if requested
         if args.save_config:

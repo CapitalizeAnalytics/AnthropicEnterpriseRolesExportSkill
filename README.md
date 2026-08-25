@@ -69,7 +69,8 @@ Leave `api_base_url` as-is unless you've been given a different endpoint. Then j
 Claude for the export — it'll find the file and skip the questions.
 
 `config.json` is listed in `.gitignore`, so a filled-in one won't be committed back to this
-repository.
+repository. Leave `api_base_url` out of the file entirely if you like — it falls back to the
+same default.
 
 ## What to expect
 
@@ -78,16 +79,56 @@ repository.
   intentional: take it seriously the same way you would for any script that reads an API
   key, even one bundled with a tool you trust.
 - Once you confirm, it makes API calls to fetch all roles and their permissions, then writes
-  one .xlsx file per custom role to the `RoleDetails/` folder.
+  one .xlsx file per custom role to the `RoleDetails/` folder, named
+  `<Role>_<yyyymmdd_hhmmss>.xlsx`. Every file in a run shares one timestamp, so runs
+  accumulate side by side instead of overwriting each other — tidy the folder yourself
+  when old exports pile up.
 - Each workbook has tabs for:
   - **Membership** — groups assigned to the role and their members
   - **Capabilities** — every observed capability, with an Enabled/Disabled flag
   - **Permissions** — admin permissions with their access level
-  - **Connectors** — connectors / tools / scopes with their approval setting
+  - **Connectors** — one row per connector / tool / scope, with its approval setting
   - **Models** — models available to the role, with a Default flag
   - **Unclassified** — any permission rows the classifier didn't recognize (only written when non-empty)
 - Afterward, if you supplied the key in chat, Claude offers to save it to `config.json`
   so future runs skip the questions. Saying no is fine — you'll just be asked again.
+
+## Naming your connectors
+
+Connector permissions come back from the API with only an opaque ID (`mcpsrv_01Example...`),
+and nothing on the roles/permissions surface turns that ID into a name. The Connectors tab
+shows the ID either way; supplying a mapping just makes it readable.
+
+(There is an analytics endpoint, `/v1/organizations/analytics/connectors`, reachable with an
+Analytics key carrying `read:analytics`. It reports connector *usage* rather than listing
+your connectors, its names are normalized across sources, and it returned no rows on any
+date tested — so it is not currently a substitute for the mapping below.)
+
+Start from `connectors.example.json` (copy it to `connectors.json`), or better, from the
+template a run generates for you. After any run, look in the output folder for
+`connectors.unresolved.json` — it's pre-filled with your real IDs, so you never type one by
+hand:
+
+```json
+{
+  "connectors": {
+    "mcpsrv_01ExampleConnectorOne00": "",
+    "mcpsrv_01ExampleConnectorTwo00": ""
+  }
+}
+```
+
+Fill in the display names from
+[claude.ai > Organization settings > Connectors](https://claude.ai/admin-settings/connectors),
+save the file as `connectors.json` in this folder (or your working directory), and re-run.
+Every row in the Connectors tab picks up its name. A flat `{"mcpsrv_...": "Asana"}` object
+works too, and `--connectors <path>` points at a file kept somewhere else.
+
+The mapping is yours to maintain — add a line whenever a new connector shows up.
+
+Both `connectors.json` and `connectors.unresolved.json` are in `.gitignore`, alongside
+`config.json`, `RoleDetails/` and `*.xlsx`. Only `connectors.example.json` is committed, so
+your own connector names and exported member lists stay out of the repository.
 
 ## Running it without Claude
 
@@ -120,6 +161,16 @@ table and shell history, so the key is only ever read from the environment or a 
   never edited. Fill in the real `admin_key`.
 - **"Requires: requests, openpyxl"** — install the dependencies with `pip install requests openpyxl`
   and try again.
+- **Membership tab reads "(no groups assigned to this role)" for every role** — the key is
+  missing the `read:rbac_groups` scope. The run still succeeds and only warns on stderr, so
+  it is easy to miss. Note that **compliance read scopes and RBAC scopes are mutually
+  exclusive**: a key granted any of the `read:compliance_*` scopes cannot also hold
+  `read:rbac_groups`. Create the key without compliance scopes to get membership data.
+  `read:analytics` and `read:rbac_groups` do coexist happily.
+- **`PermissionError: [Errno 13]` writing an .xlsx** — that workbook is open in Excel, which
+  locks the file. Close it and re-run. Timestamped filenames make this rare.
+- **Connectors tab shows `(unnamed - add to connectors.json)`** — expected until you supply a
+  mapping. See [Naming your connectors](#naming-your-connectors).
 
 ## Security
 

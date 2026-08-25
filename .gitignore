@@ -1,6 +1,15 @@
+# Credentials - never commit
 config.json
+
+# Export output (contains member emails and user IDs)
 RoleDetails/
 *.xlsx
+
+# Your connector name mapping, and the generated fill-in template.
+# Both are environment-specific; connectors.example.json is the committed template.
+connectors.json
+connectors.unresolved.json
+
 __pycache__/
 .DS_Store
 .vscode/
